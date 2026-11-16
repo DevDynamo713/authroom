@@ -2,4 +2,7 @@ node_modules
 .next
 test-results
 .env
+.env.local
 .DS_Store
+.vercel
+.wrangler

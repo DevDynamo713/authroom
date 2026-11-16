@@ -1,37 +1,53 @@
 export interface Env { AUTHROOM_DO: DurableObjectNamespace; }
+interface Session { id: string; device: string; user: string; active: boolean; ts: number }
+interface State { sessions: Session[] }
+const DEFAULT_STATE: State = { sessions: [] };
+const SESSION_CAP = 100;
+
 export class AuthRoomDO {
   private state: DurableObjectState;
-  private sessions: Map<string, any> = new Map();
-  private websockets: WebSocket[] = [];
   constructor(state: DurableObjectState, env: Env) { this.state = state; }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === '/ws') {
+    const storage = this.state.storage;
+
+    if (url.pathname.endsWith('/ws')) {
       const pair = new WebSocketPair();
       this.state.acceptWebSocket(pair[1]);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
-    if (url.pathname === '/sessions' && request.method === 'GET') {
-      return Response.json(Array.from(this.sessions.values()));
+    if (url.pathname.endsWith('/state') && request.method === 'GET') {
+      const s: State = (await storage.get('state')) || DEFAULT_STATE;
+      return new Response(JSON.stringify(s), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
-    if (url.pathname === '/session' && request.method === 'POST') {
-      const data = await request.json();
-      const session = { ...data, id: crypto.randomUUID(), createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600000).toISOString(), revoked: false };
-      this.sessions.set(session.id, session);
-      this.broadcast(JSON.stringify({ type: 'session', data: session }));
-      return Response.json({ success: true, session });
+    if (url.pathname.endsWith('/event') && request.method === 'POST') {
+      const d = await request.json() as { kind: 'open' | 'revoke'; sessionId: string; device?: string; user?: string; ts: number };
+      const s: State = (await storage.get('state')) || DEFAULT_STATE;
+      if (d.kind === 'open') {
+        const rec: Session = { id: d.sessionId, device: d.device || 'unknown', user: d.user || 'anon', active: true, ts: Number(d.ts) };
+        s.sessions = [...s.sessions, rec].slice(-SESSION_CAP);
+      } else {
+        s.sessions = s.sessions.map((x) => (x.id === d.sessionId ? { ...x, active: false, ts: Number(d.ts) } : x));
+      }
+      await storage.put('state', s);
+      this.broadcast(JSON.stringify({ type: 'event', data: d }));
+      return new Response(JSON.stringify({ success: true }), { headers: { 'Access-Control-Allow-Origin': '*' } });
     }
     return new Response('Not Found', { status: 404 });
   }
-  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) { }
-  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) { this.websockets = this.websockets.filter(w => w !== ws); }
-  private broadcast(msg: string) { for (const ws of this.websockets) { if (ws.readyState === 1) ws.send(msg); } }
-}
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    const url = new URL(request.url);
-    const id = env.AUTHROOM_DO.idFromName(url.pathname);
-    const stub = env.AUTHROOM_DO.get(id);
-    return stub.fetch(request);
+
+  private broadcast(msg: string) {
+    for (const ws of this.state.getWebSockets()) { if (ws.readyState === 1) ws.send(msg); }
   }
 }
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const rm = url.pathname.match(/\/room\/([^/]+)/);
+    const room = rm ? rm[1] : 'default';
+    const id = env.AUTHROOM_DO.idFromName(room);
+    return env.AUTHROOM_DO.get(id).fetch(request);
+  }
+};
